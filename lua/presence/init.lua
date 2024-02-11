@@ -531,8 +531,8 @@ function Presence:get_nvim_socket_paths(on_done)
 	if self.os.is_wsl then
 		-- TODO: There needs to be a better way of doing this... no support for ss/netstat?
 		-- (See https://github.com/microsoft/WSL/issues/2249)
-		local cmd_fmt = "for file in %s/nvim*; do echo $file/0; done"
-		local shell_cmd = string.format(cmd_fmt, vim.loop.os_tmpdir() or "/tmp")
+		local cmd_fmt = "for file in %s/nvim*; do echo $file; done"
+		local shell_cmd = string.format(cmd_fmt, vim.fn.stdpath("run") or "/tmp")
 
 		cmd = {
 			"sh",
@@ -558,14 +558,14 @@ function Presence:get_nvim_socket_paths(on_done)
 
 		cmd = table.concat({
 			"netstat -u",
-			[[grep --color=never "nvim.*/0"]],
+			[[grep -E --color=never ".+nvim.+"]],
 		}, "|")
 	elseif self.os.name == "linux" then
 		if vim.fn.executable("ss") == 1 then
 			-- Use `ss` if available
 			cmd = table.concat({
 				"ss -lx",
-				[[grep "nvim.*/0"]],
+				[[grep -E ".+nvim.+"]],
 			}, "|")
 
 			-- Define ss output parser
@@ -576,7 +576,7 @@ function Presence:get_nvim_socket_paths(on_done)
 			-- Use `netstat` if available
 			cmd = table.concat({
 				"netstat -u",
-				[[grep --color=never "nvim.*/0"]],
+				[[grep -E --color=never ".+nvim.+"]],
 			}, "|")
 
 			-- Define netstat output parser
@@ -1074,15 +1074,13 @@ function Presence:register_and_sync_peer(id, socket)
 		end
 	end
 
-	self:call_remote_method(
-		socket,
-		"sync_self",
-		{ {
+	self:call_remote_method(socket, "sync_self", {
+		{
 			last_activity = self.last_activity,
 			peers = peers,
 			workspaces = self.workspaces,
-		} }
-	)
+		},
+	})
 end
 
 -- Register self to any remote Neovim instances
@@ -1160,15 +1158,13 @@ function Presence:sync_self_activity()
 			end
 		end
 
-		self:call_remote_method(
-			peer.socket,
-			"sync_peer_activity",
-			{ {
+		self:call_remote_method(peer.socket, "sync_peer_activity", {
+			{
 				last_activity = self.last_activity,
 				peers = peers,
 				workspaces = self.workspaces,
-			} }
-		)
+			},
+		})
 	end
 end
 
