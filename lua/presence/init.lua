@@ -438,7 +438,10 @@ function Presence:get_project_name(file_path)
 	if not file_path then
 		return nil
 	end
-
+	-- if filepath has oil:// remove it
+	if file_path:find("oil://") then
+		file_path = file_path:gsub("oil://", "")
+	end
 	-- Escape quotes in the file path
 	file_path = file_path:gsub([["]], [[\"]])
 
