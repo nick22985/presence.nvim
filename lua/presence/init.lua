@@ -68,6 +68,64 @@ local default_file_assets = require("presence.file_assets")
 local plugin_managers = require("presence.plugin_managers")
 local Discord = require("presence.discord")
 
+local function create_config(self, buffer)
+	if buffer ~= nil and buffer:find("^oil://") then
+		buffer = buffer:gsub("oil://", "")
+	end
+	if not buffer or buffer == "" then
+		return nil
+	end
+	local filetype = vim.bo.filetype
+
+	local filename = self.get_filename(buffer, self.os.path_separator)
+	local parent_dirpath = self.get_dir_path(buffer, self.os.path_separator)
+
+	self.log:debug(string.format("Filename: %s, Parent Directory Path: %s", filename, parent_dirpath))
+
+	local line_number = vim.api.nvim_win_get_cursor(0)[1]
+	local line_count = vim.api.nvim_buf_line_count(0)
+	local project_name, project_path = nil, nil
+
+	if parent_dirpath and vim.fn.isdirectory(parent_dirpath) == 1 then
+		project_name, project_path = self:get_project_name(parent_dirpath)
+	end
+
+	local file_path = nil
+
+	if file_path ~= nil and file_path:find("^oil://") then
+		file_path = file_path:gsub("oil://", "")
+	end
+
+	if parent_dirpath ~= nil and parent_dirpath:find("^oil://") then
+		parent_dirpath = parent_dirpath:gsub("oil://", "")
+	end
+
+	if filename ~= nil and filename:find("^oil://") then
+		filename = filename:gsub("oil://", "")
+	end
+
+	if filetype ~= nil and filetype:find("^oil://") then
+		filetype = filetype:gsub("oil://", "")
+	end
+
+	local file_explorer = file_explorers[filetype:match("[^%d]+")] or file_explorers[(filename or ""):match("[^%d]+")]
+
+	local plugin_manager = plugin_managers[filetype]
+
+	return {
+		filename = filename,
+		line_number = line_number,
+		line_count = line_count,
+		project_name = project_name,
+		project_path = project_path,
+		buffer = buffer,
+		filetype = filetype,
+		parent_dirpath = parent_dirpath,
+		file_explorer = file_explorer,
+		plugin_manager = plugin_manager,
+	}
+end
+
 function Presence:setup(...)
 	-- Support setup invocation via both dot and colon syntax.
 	-- To maintain backwards compatibility, colon syntax will still
@@ -488,40 +546,41 @@ function Presence.get_file_extension(path)
 end
 
 -- Format any status text via options and support custom formatter functions
-function Presence:format_status_text(status_type, ...)
+function Presence:format_status_text(status_type, config)
 	local option_name = string.format("%s_text", status_type)
 	local text_option = self.options[option_name]
 	if type(text_option) == "function" then
-		return text_option(...)
+		return text_option(config)
 	else
-		return string.format(text_option, ...)
+		return string.format(text_option, config.filename)
 	end
 end
 
 -- Get the status text for the current buffer
-function Presence:get_status_text(filename)
-	local file_explorer = file_explorers[vim.bo.filetype:match("[^%d]+")]
-		or file_explorers[(filename or ""):match("[^%d]+")]
-	local plugin_manager = plugin_managers[vim.bo.filetype]
+-- Update the function to pass config
+function Presence:get_status_text(config)
+	-- Use the file_explorer and plugin_manager directly from the config
+	local file_explorer = config.file_explorer
+	local plugin_manager = config.plugin_manager
 
 	if file_explorer then
-		return self:format_status_text("file_explorer", file_explorer)
+		return self:format_status_text("file_explorer", config)
 	elseif plugin_manager then
-		return self:format_status_text("plugin_manager", plugin_manager)
+		return self:format_status_text("plugin_manager", config)
 	end
 
-	if not filename or filename == "" then
+	if not config.filename or config.filename == "" then
 		return nil
 	end
 
 	if vim.bo.modifiable and not vim.bo.readonly then
-		if vim.bo.filetype == "gitcommit" then
-			return self:format_status_text("git_commit", filename)
-		elseif filename then
-			return self:format_status_text("editing", filename)
+		if config.filetype == "gitcommit" then
+			return self:format_status_text("git_commit", config)
+		elseif config.filename then
+			return self:format_status_text("editing", config)
 		end
-	elseif filename then
-		return self:format_status_text("reading", filename)
+	elseif config.filename then
+		return self:format_status_text("reading", config)
 	end
 end
 
@@ -832,35 +891,32 @@ end
 
 -- Update Rich Presence for the provided vim buffer
 function Presence:update_for_buffer(buffer, should_debounce)
-	-- Avoid unnecessary updates if the previous activity was for the current buffer
-	-- (allow same-buffer updates when line numbers are enabled)
-	if self.options.enable_line_number == 0 and self.last_activity.file == buffer then
-		self.log:debug(string.format("Activity already set for %s, skipping...", buffer))
+	local config = create_config(self, buffer)
+
+	if config == nil then
+		self.log:debug("No config found for buffer, skipping...")
 		return
 	end
 
-	-- Parse vim buffer
-	local filename = self.get_filename(buffer, self.os.path_separator)
-	local parent_dirpath = self.get_dir_path(buffer, self.os.path_separator)
-	local extension = filename and self.get_file_extension(filename) or nil
-	self.log:debug(string.format("Parsed filename %s with %s extension", filename, extension or "no"))
+	-- Avoid unnecessary updates if the previous activity was for the current buffer
+	-- (allow same-buffer updates when line numbers are enabled)
+	if self.options.enable_line_number == 0 and self.last_activity.file == buffer then
+		self.log:debug(string.format("Activity already set for %s, skipping...", config.filename))
+		return
+	end
 
-	-- Return early if there is no valid activity status text to set
-	local status_text = self:get_status_text(filename)
+	local status_text = self:get_status_text(config)
 	if not status_text then
 		return self.log:debug("No status text for the given buffer, skipping...")
 	end
 
-	-- Get project information
-	self.log:debug(string.format("Getting project name for %s...", parent_dirpath))
-	local project_name, project_path = self:get_project_name(parent_dirpath)
-
 	-- Check for blacklist
 	local blacklist_not_empty = (#self.options.blacklist > 0 or #self.options.blacklist_repos > 0)
-	local is_blacklisted = blacklist_not_empty and self:check_blacklist(buffer, parent_dirpath, project_path)
+	local is_blacklisted = blacklist_not_empty
+		and self:check_blacklist(buffer, config.parent_dirpath, config.project_path)
 	if is_blacklisted then
 		self.last_activity.file = buffer
-		self.log:debug("Either project, directory name, or repository URL is blacklisted. Skipping...")
+		self.log:debug("Either project or directory name is blacklisted, skipping...")
 		self:cancel()
 		return
 	end
@@ -873,17 +929,16 @@ function Presence:update_for_buffer(buffer, should_debounce)
 	self.log:debug(string.format("Setting activity for %s...", buffer and #buffer > 0 and buffer or "unnamed buffer"))
 
 	-- Determine image text and asset key
-	local name = filename
 	local asset_key = "code"
-	local description = filename
-	local file_asset = self.options.file_assets[filename] or self.options.file_assets[extension]
+	local description = config.filename
+	local file_asset = self.options.file_assets[config.filename] or self.options.file_assets[config.filetype]
 	if file_asset then
-		name, asset_key, description = unpack(file_asset)
+		config.name, asset_key, description = unpack(file_asset)
 		self.log:debug(string.format("Using file asset: %s", vim.inspect(file_asset)))
 	end
 
 	-- Construct activity asset information
-	local file_text = description or name
+	local file_text = description or config.filename
 	local neovim_image_text = self.options.neovim_image_text
 	local use_file_as_main_image = self.options.main_image == "file"
 	local use_neovim_as_main_image = self.options.main_image == "neovim"
@@ -899,14 +954,12 @@ function Presence:update_for_buffer(buffer, should_debounce)
 	local activity = {
 		state = status_text,
 		assets = assets,
-		timestamps = self.options.show_time == 1 and {
-			start = relative_activity_set_at,
-		} or nil,
+		timestamps = self.options.show_time == 1 and { start = relative_activity_set_at } or nil,
 	}
 
-	-- Add button that links to the git workspace remote origin url
+	-- Add button that links to the git workspace remote origin URL
 	if self.options.buttons ~= 0 then
-		local buttons = self:get_buttons(buffer, parent_dirpath)
+		local buttons = self:get_buttons(buffer, config.parent_dirpath)
 		if buttons then
 			self.log:debug(string.format("Attaching buttons to activity: %s", vim.inspect(buttons)))
 			activity.buttons = buttons
@@ -916,13 +969,9 @@ function Presence:update_for_buffer(buffer, should_debounce)
 	-- Get the current line number and line count if the user has set the enable_line_number option
 	if self.options.enable_line_number == 1 then
 		self.log:debug("Getting line number for current buffer...")
-
-		local line_number = vim.api.nvim_win_get_cursor(0)[1]
-		local line_count = vim.api.nvim_buf_line_count(0)
-		local line_number_text = self:format_status_text("line_number", line_number, line_count)
+		local line_number_text = self:format_status_text("line_number", config)
 
 		activity.details = line_number_text
-
 		self.workspace = nil
 		self.last_activity = {
 			id = self.id,
@@ -933,29 +982,27 @@ function Presence:update_for_buffer(buffer, should_debounce)
 		}
 	else
 		-- Include project details if available and if the user hasn't set the enable_line_number option
-		if project_name then
-			self.log:debug(string.format("Detected project: %s", project_name))
+		if config.project_name then
+			self.log:debug(string.format("Detected project: %s", config.project_name))
 
-			activity.details = self:format_status_text("workspace", project_name, buffer)
+			activity.details = self:format_status_text("workspace", config)
 
-			self.workspace = project_path
+			self.workspace = config.project_path
 			self.last_activity = {
 				id = self.id,
 				file = buffer,
 				set_at = activity_set_at,
 				relative_set_at = relative_activity_set_at,
-				workspace = project_path,
+				workspace = config.project_path,
 			}
 
-			if self.workspaces[project_path] then
-				self.workspaces[project_path].updated_at = activity_set_at
+			if self.workspaces[config.project_path] then
+				self.workspaces[config.project_path].updated_at = activity_set_at
 				activity.timestamps = self.options.show_time == 1
-						and {
-							start = self.workspaces[project_path].started_at,
-						}
+						and { start = self.workspaces[config.project_path].started_at }
 					or nil
 			else
-				self.workspaces[project_path] = {
+				self.workspaces[config.project_path] = {
 					started_at = activity_set_at,
 					updated_at = activity_set_at,
 				}
@@ -999,7 +1046,7 @@ function Presence:update_for_buffer(buffer, should_debounce)
 			return
 		end
 
-		self.log:info(string.format("Set activity in Discord for %s", filename))
+		self.log:info(string.format("Set activity in Discord for %s", config.filename))
 	end)
 end
 
