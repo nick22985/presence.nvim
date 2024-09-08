@@ -72,9 +72,7 @@ local function create_config(self, buffer)
 	if buffer ~= nil and buffer:find("^oil://") then
 		buffer = buffer:gsub("oil://", "")
 	end
-	if not buffer or buffer == "" then
-		return nil
-	end
+
 	local filetype = vim.bo.filetype
 
 	local filename = self.get_filename(buffer, self.os.path_separator)
@@ -82,47 +80,31 @@ local function create_config(self, buffer)
 
 	self.log:debug(string.format("Filename: %s, Parent Directory Path: %s", filename, parent_dirpath))
 
-	local line_number = vim.api.nvim_win_get_cursor(0)[1]
+	local line_number = vim.api.nvim_win_get_cursor(0)
 	local line_count = vim.api.nvim_buf_line_count(0)
-	local project_name, project_path = nil, nil
+	local project_name, project_path, project_branch = nil, nil, nil
 
-	if parent_dirpath and vim.fn.isdirectory(parent_dirpath) == 1 then
-		project_name, project_path = self:get_project_name(parent_dirpath)
-	end
-
-	local file_path = nil
-
-	if file_path ~= nil and file_path:find("^oil://") then
-		file_path = file_path:gsub("oil://", "")
-	end
-
-	if parent_dirpath ~= nil and parent_dirpath:find("^oil://") then
-		parent_dirpath = parent_dirpath:gsub("oil://", "")
-	end
-
-	if filename ~= nil and filename:find("^oil://") then
-		filename = filename:gsub("oil://", "")
-	end
-
-	if filetype ~= nil and filetype:find("^oil://") then
-		filetype = filetype:gsub("oil://", "")
-	end
+	project_name, project_path, project_branch = self:get_project_name(parent_dirpath)
 
 	local file_explorer = file_explorers[filetype:match("[^%d]+")] or file_explorers[(filename or ""):match("[^%d]+")]
 
 	local plugin_manager = plugin_managers[filetype]
+	local git_repo = Presence.get_git_repo_url(parent_dirpath)
 
 	return {
 		filename = filename,
-		line_number = line_number,
+		line_number = line_number[1],
+		line_col = line_number[2],
 		line_count = line_count,
 		project_name = project_name,
 		project_path = project_path,
+		project_branch = project_branch,
 		buffer = buffer,
 		filetype = filetype,
 		parent_dirpath = parent_dirpath,
 		file_explorer = file_explorer,
 		plugin_manager = plugin_manager,
+		git_repo = git_repo,
 	}
 end
 
@@ -494,40 +476,61 @@ end
 
 -- Gets the current project name
 function Presence:get_project_name(file_path)
-	if not file_path then
-		return nil
-	end
-	-- if filepath has oil:// remove it
-	if file_path:find("^oil://") then
-		file_path = file_path:gsub("oil://", "")
-	end
-	-- Escape quotes in the file path
-	file_path = file_path:gsub([["]], [[\"]])
+    if not file_path then
+        return nil, nil, nil
+    end
 
-	-- TODO: Only checks for a git repository, could add more checks here
-	-- Might want to run this in a background process depending on performance
-	local project_path_cmd = "git rev-parse --show-toplevel"
-	project_path_cmd = file_path and string.format([[cd "%s" && %s]], file_path, project_path_cmd) or project_path_cmd
+    -- Escape quotes in the file path
+    file_path = file_path:gsub([["]], [[\"]])
 
-	local project_path = vim.fn.system(project_path_cmd)
-	project_path = vim.trim(project_path)
+    -- TODO: Only checks for a git repository, could add more checks here
+    -- Might want to run this in a background process depending on performance
+    local project_path_cmd = "git rev-parse --show-toplevel"
+    project_path_cmd = file_path and string.format([[cd "%s" && %s]], file_path, project_path_cmd) or project_path_cmd
 
-	if project_path:find("fatal.*") then
-		self.log:info("Not a git repository, skipping...")
-		return nil
-	end
-	if vim.v.shell_error ~= 0 or #project_path == 0 then
-		local message_fmt = "Failed to get project name (error code %d): %s"
-		self.log:error(string.format(message_fmt, vim.v.shell_error, project_path))
-		return nil
-	end
+    local project_path = vim.fn.system(project_path_cmd)
+    project_path = vim.trim(project_path)
 
-	-- Since git always uses forward slashes, replace with backslash in Windows
-	if self.os.name == "windows" then
-		project_path = project_path:gsub("/", [[\]])
-	end
+    if project_path:find("fatal.*") then
+        self.log:info("Not a git repository, skipping...")
+        return nil, nil, nil
+    end
+    if vim.v.shell_error ~= 0 or #project_path == 0 then
+        local message_fmt = "Failed to get project name (error code %d): %s"
+        self.log:error(string.format(message_fmt, vim.v.shell_error, project_path))
+        return nil, nil, nil
+    end
 
-	return self.get_filename(project_path, self.os.path_separator), project_path
+    if self.os.name == "windows" then
+        project_path = project_path:gsub("/", [[\]])
+    end
+
+    local repo_name_cmd = [[basename -s .git "$(git config --get remote.origin.url)"]]
+    repo_name_cmd = file_path and string.format([[cd "%s" && %s]], file_path, repo_name_cmd) or repo_name_cmd
+
+    local repo_name = vim.fn.system(repo_name_cmd)
+    repo_name = vim.trim(repo_name)
+
+    if vim.v.shell_error ~= 0 or #repo_name == 0 then
+        local message_fmt = "Failed to get repository name (error code %d): %s"
+        self.log:error(string.format(message_fmt, vim.v.shell_error, repo_name))
+        return nil, project_path, nil
+    end
+
+    -- Fetch the branch name
+    local branch_name_cmd = "git rev-parse --abbrev-ref HEAD"
+    branch_name_cmd = file_path and string.format([[cd "%s" && %s]], file_path, branch_name_cmd) or branch_name_cmd
+
+    local branch_name = vim.fn.system(branch_name_cmd)
+    branch_name = vim.trim(branch_name)
+
+    if vim.v.shell_error ~= 0 or #branch_name == 0 then
+        local message_fmt = "Failed to get branch name (error code %d): %s"
+        self.log:error(string.format(message_fmt, vim.v.shell_error, branch_name))
+        return repo_name, project_path, nil
+    end
+
+    return repo_name, project_path, branch_name
 end
 
 -- Get the name of the parent directory for the given path
