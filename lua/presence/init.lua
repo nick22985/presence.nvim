@@ -173,6 +173,7 @@ function Presence:setup(...)
 	self:set_option("blacklist_repos", {})
 	self:set_option("buttons", true)
 	self:set_option("show_time", true)
+	self:set_option("use_session_time", false)
 	-- File assets options
 	self:set_option("file_assets", {})
 	for name, asset in pairs(default_file_assets) do
@@ -207,6 +208,9 @@ function Presence:setup(...)
 
 	-- Ensure auto-update config is reflected in its global var setting
 	vim.api.nvim_set_var("presence_auto_update", options.auto_update)
+
+	-- Initialize session start time for use_session_time option
+	self.session_started_at = os.time()
 
 	-- Set autocommands
 	vim.fn["presence#SetAutoCmds"]()
@@ -927,7 +931,13 @@ function Presence:update_for_buffer(buffer, should_debounce)
 	local activity_set_at = os.time()
 	-- If we shouldn't debounce and we trigger an activity, keep this value the same.
 	-- Otherwise set it to the current time.
-	local relative_activity_set_at = should_debounce and self.last_activity.relative_set_at or os.time()
+	-- If use_session_time is enabled, always use the session start time.
+	local relative_activity_set_at
+	if self.options.use_session_time == 1 then
+		relative_activity_set_at = self.session_started_at
+	else
+		relative_activity_set_at = should_debounce and self.last_activity.relative_set_at or os.time()
+	end
 
 	self.log:debug(string.format("Setting activity for %s...", buffer and #buffer > 0 and buffer or "unnamed buffer"))
 
@@ -1001,12 +1011,18 @@ function Presence:update_for_buffer(buffer, should_debounce)
 
 			if self.workspaces[config.project_path] then
 				self.workspaces[config.project_path].updated_at = activity_set_at
+				local workspace_start_time = self.options.use_session_time == 1 
+					and self.session_started_at 
+					or self.workspaces[config.project_path].started_at
 				activity.timestamps = self.options.show_time == 1
-						and { start = self.workspaces[config.project_path].started_at }
+						and { start = workspace_start_time }
 					or nil
 			else
+				local workspace_start_time = self.options.use_session_time == 1 
+					and self.session_started_at 
+					or activity_set_at
 				self.workspaces[config.project_path] = {
-					started_at = activity_set_at,
+					started_at = workspace_start_time,
 					updated_at = activity_set_at,
 				}
 			end
