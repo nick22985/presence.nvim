@@ -33,7 +33,8 @@ end
 -- https://github.com/discord/discord-rpc/blob/master/documentation/hard-mode.md#notes
 function Discord:connect(on_connect)
 	if self.pipe:is_closing() then
-		self.pipe = vim.loop.new_pipe(false)
+		local uv = vim.uv or vim.loop
+		self.pipe = uv.new_pipe(false)
 	end
 
 	self.pipe:connect(self.ipc_socket, on_connect)
@@ -88,7 +89,9 @@ function Discord:read_message(nonce, on_response, err, chunk)
 		local err_format = "Pipe read error - %s"
 		local err_message = string.format(err_format, err)
 
-		on_response(err_message)
+		if on_response then
+			on_response(err_message)
+		end
 	elseif chunk then
 		-- Strip header from the chunk
 		local message = chunk:match("({.+)")
@@ -100,7 +103,11 @@ function Discord:read_message(nonce, on_response, err, chunk)
 				local err_format = "Received unexpected opcode - %s (code %s)"
 				local err_message = string.format(err_format, response.message, response.code)
 
-				return on_response(err_message)
+				if on_response then
+					return on_response(err_message)
+				else
+					return
+				end
 			end
 
 			-- Unable to decode the response
@@ -108,7 +115,11 @@ function Discord:read_message(nonce, on_response, err, chunk)
 				-- Indetermine state at this point, no choice but to simply warn on the parse failure
 				-- but invoke empty response callback as request may still have succeeded
 				self.log:warn(string.format("Failed to decode payload: %s", vim.inspect(message)))
-				return on_response()
+				if on_response then
+					return on_response()
+				else
+					return
+				end
 			end
 
 			-- Check for an error event response
@@ -117,7 +128,11 @@ function Discord:read_message(nonce, on_response, err, chunk)
 				local err_format = "Received error event - %s (code %s)"
 				local err_message = string.format(err_format, data.message, data.code)
 
-				return on_response(err_message)
+				if on_response then
+					return on_response(err_message)
+				else
+					return
+				end
 			end
 
 			-- Check for a valid nonce value
@@ -125,10 +140,16 @@ function Discord:read_message(nonce, on_response, err, chunk)
 				local err_format = "Received unexpected nonce - %s (expected %s)"
 				local err_message = string.format(err_format, response.nonce, nonce)
 
-				return on_response(err_message)
+				if on_response then
+					return on_response(err_message)
+				else
+					return
+				end
 			end
 
-			on_response(nil, response)
+			if on_response then
+				on_response(nil, response)
+			end
 		end)
 	else
 		-- TODO: Handle when pipe is closed
@@ -150,12 +171,13 @@ end
 
 -- Call to set the Neovim activity to Discord
 function Discord:set_activity(activity, on_response)
+	local uv = vim.uv or vim.loop
 	local payload = {
 		cmd = "SET_ACTIVITY",
 		nonce = self.generate_uuid(),
 		args = {
 			activity = activity,
-			pid = vim.loop:os_getpid(),
+			pid = uv.os_getpid(),
 		},
 	}
 

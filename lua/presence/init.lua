@@ -59,6 +59,9 @@ Presence.peers = {}
 Presence.socket = vim.v.servername
 Presence.workspace = nil
 Presence.workspaces = {}
+Presence.is_idle = false
+Presence.last_activity_time = os.time()
+Presence.idle_timer = nil
 
 local log = require("lib.log")
 local msgpack = require("deps.msgpack")
@@ -85,12 +88,69 @@ local function create_config(self, buffer)
 	local line_count = vim.api.nvim_buf_line_count(0)
 	local project_name, project_path, project_branch = nil, nil, nil
 
+	-- Get initial project info from file path
 	project_name, project_path, project_branch = self:get_project_name(parent_dirpath)
+	local git_repo = Presence.get_git_repo_url(parent_dirpath)
 
 	local file_explorer = file_explorers[filetype:match("[^%d]+")] or file_explorers[(filename or ""):match("[^%d]+")]
-
 	local plugin_manager = plugin_managers[filetype]
-	local git_repo = Presence.get_git_repo_url(parent_dirpath)
+
+	-- For file explorers without file context, try to get current working directory info
+	if file_explorer and (not project_name or project_name == "") then
+		local cwd = vim.fn.getcwd()
+		if cwd then
+			-- Get project info from current working directory
+			local cwd_project_name, cwd_project_path, cwd_project_branch = self:get_project_name(cwd)
+			local cwd_git_repo = Presence.get_git_repo_url(cwd)
+
+			-- Use CWD info if we found better data
+			if cwd_project_name and cwd_project_name ~= "" then
+				project_name = cwd_project_name
+				project_path = cwd_project_path
+				project_branch = cwd_project_branch
+				git_repo = cwd_git_repo
+			else
+				-- Fallback to just directory name
+				local cwd_name = cwd:match("([^/\\]+)[/\\]*$")
+				if cwd_name then
+					project_name = cwd_name
+					project_path = cwd
+				end
+			end
+
+			if not parent_dirpath or parent_dirpath == "" then
+				parent_dirpath = cwd
+			end
+		end
+	end
+
+	-- Get LSP diagnostic counts from all buffers
+	local diagnostics = vim.diagnostic.get() -- Get diagnostics for all buffers
+	local problems = {
+		error = 0,
+		warn = 0,
+		info = 0,
+		hint = 0,
+	}
+
+	for _, diagnostic in ipairs(diagnostics) do
+		if diagnostic.severity == vim.diagnostic.severity.ERROR then
+			problems.error = problems.error + 1
+		elseif diagnostic.severity == vim.diagnostic.severity.WARN then
+			problems.warn = problems.warn + 1
+		elseif diagnostic.severity == vim.diagnostic.severity.INFO then
+			problems.info = problems.info + 1
+		elseif diagnostic.severity == vim.diagnostic.severity.HINT then
+			problems.hint = problems.hint + 1
+		else
+		end
+	end
+
+	local problems_total = problems.error + problems.warn + problems.info + problems.hint
+
+	-- Add idle state information
+	local current_time = os.time()
+	local idle_time = current_time - (self.last_activity_time or current_time)
 
 	return {
 		filename = filename,
@@ -107,6 +167,11 @@ local function create_config(self, buffer)
 		file_explorer = file_explorer,
 		plugin_manager = plugin_manager,
 		git_repo = git_repo,
+		problems = problems,
+		problems_total = problems_total,
+		is_idle = self.is_idle or false,
+		idle_time = idle_time,
+		last_activity_time = self.last_activity_time or current_time,
 	}
 end
 
@@ -130,7 +195,8 @@ function Presence:setup(...)
 
 	-- Get operating system information including path separator
 	-- http://www.lua.org/manual/5.3/manual.html#pdf-package.config
-	local uname = vim.loop.os_uname()
+	local uv = vim.uv or vim.loop
+	local uname = uv.os_uname()
 	local separator = package.config:sub(1, 1)
 	local wsl_distro_name = os.getenv("WSL_DISTRO_NAME")
 	local os_name = self.get_os_name(uname)
@@ -148,7 +214,8 @@ function Presence:setup(...)
 			or string.format(setup_message_fmt, self.os.name)
 		self.log:debug(setup_message)
 	else
-		self.log:error(string.format("Unable to detect operating system: %s", vim.inspect(vim.loop.os_uname())))
+		local uv = vim.uv or vim.loop
+		self.log:error(string.format("Unable to detect operating system: %s", vim.inspect(uv.os_uname())))
 	end
 
 	-- Use the default or user-defined client id if provided
@@ -162,7 +229,11 @@ function Presence:setup(...)
 	self:set_option("debounce_timeout", 10)
 	self:set_option("neovim_image_text", "The One True Text Editor")
 	self:set_option("main_image", "neovim")
-	self:set_option("enable_line_number", false)
+	-- enable_line_number option removed - now handled in user's status text functions
+	self:set_option("enable_idle", 1) -- Enable/disable idle detection
+	self:set_option("idle_timeout", 300) -- 5 minutes in seconds
+	self:set_option("idle_text", "Idle")
+	self:set_option("idle_asset", "idle")
 	-- Status text options
 	self:set_option("editing_text", "Editing %s")
 	self:set_option("file_explorer_text", "Browsing %s")
@@ -170,7 +241,7 @@ function Presence:setup(...)
 	self:set_option("plugin_manager_text", "Managing plugins")
 	self:set_option("reading_text", "Reading %s")
 	self:set_option("workspace_text", "Working on %s")
-	self:set_option("line_number_text", "Line %s out of %s")
+	-- line_number_text option removed - now handled in user's editing_text function
 	self:set_option("blacklist", {})
 	self:set_option("blacklist_repos", {})
 	self:set_option("buttons", true)
@@ -222,6 +293,16 @@ function Presence:setup(...)
 
 	-- Initialize session start time for use_session_time option
 	self.session_started_at = os.time()
+	
+	-- Initialize idle tracking
+	self.last_activity_time = os.time()
+	self.is_idle = false
+	
+	-- Start idle timer if enabled and idle_timeout is set
+	if (self.options.enable_idle == 1 or self.options.enable_idle == true) and self.options.idle_timeout and self.options.idle_timeout > 0 then
+		self:start_idle_timer()
+		self.log:debug(string.format("Started idle timer with timeout: %d seconds", self.options.idle_timeout))
+	end
 
 	-- Set autocommands
 	vim.fn["presence#SetAutoCmds"]()
@@ -293,7 +374,8 @@ function Presence:check_discord_socket(path)
 	self.log:debug(string.format("Checking Discord IPC socket at %s...", path))
 
 	-- Asynchronously check socket path via stat
-	vim.loop.fs_stat(path, function(err, stats)
+	local uv = vim.uv or vim.loop
+	uv.fs_stat(path, function(err, stats)
 		if err then
 			local err_msg = "Failed to get socket information"
 			self.log:error(string.format("%s: %s", err_msg, err))
@@ -330,7 +412,8 @@ end
 
 -- Call a command on a remote Neovim instance at the provided IPC path
 function Presence:call_remote_nvim_instance(socket, command)
-	local remote_nvim_instance = vim.loop.new_pipe(true)
+	local uv = vim.uv or vim.loop
+	local remote_nvim_instance = uv.new_pipe(true)
 
 	remote_nvim_instance:connect(socket, function()
 		self.log:debug(string.format("Connected to remote nvim instance at %s", socket))
@@ -568,9 +651,16 @@ function Presence:format_status_text(status_type, config)
 	local option_name = string.format("%s_text", status_type)
 	local text_option = self.options[option_name]
 	if type(text_option) == "function" then
-		return text_option(config)
+		local result = text_option(config)
+		-- If function returns a table, extract all possible fields
+		if type(result) == "table" then
+			return result.state, result.details, result.large_image, result.large_text, result.small_image, result.small_text
+		else
+			-- Otherwise use the result as state and no details
+			return result, nil, nil, nil, nil, nil
+		end
 	else
-		return string.format(text_option, config.filename)
+		return string.format(text_option, config.filename), nil, nil, nil, nil, nil
 	end
 end
 
@@ -580,10 +670,14 @@ function Presence:process_asset_url_template(url_template, config)
 		return url_template
 	end
 
-	local processed_url = url_template:gsub("{lang}", config.extension or "")
-	P(processed_url)
+	-- Only process if it's actually a URL template (contains placeholders or is a URL)
+	if url_template:match("{.*}") or url_template:match("^https?://") then
+		local processed_url = url_template:gsub("{lang}", config.extension or "")
+		return processed_url
+	end
 
-	return processed_url
+	-- Return as-is if it's not a URL template
+	return url_template
 end
 
 -- Get the status text for the current buffer
@@ -600,7 +694,7 @@ function Presence:get_status_text(config)
 	end
 
 	if not config.filename or config.filename == "" then
-		return nil
+		return nil, nil, nil, nil, nil, nil
 	end
 
 	if vim.bo.modifiable and not vim.bo.readonly then
@@ -793,8 +887,8 @@ function Presence:check_blacklist(buffer, parent_dirpath, project_dirpath)
 		-- Match parent either by Lua pattern or by plain string
 		local is_parent_directory_blacklisted = parent_dirpath
 			and (
-				(parent_dirpath:match(val) == parent_dirpath or parent_dirname:match(val) == parent_dirname)
-				or (parent_dirpath:find(val, nil, true) or parent_dirname:find(val, nil, true))
+				(parent_dirpath:match(val) == parent_dirpath or (parent_dirname and parent_dirname:match(val) == parent_dirname))
+				or (parent_dirpath:find(val, nil, true) or (parent_dirname and parent_dirname:find(val, nil, true)))
 			)
 		if is_parent_directory_blacklisted then
 			return true
@@ -803,8 +897,8 @@ function Presence:check_blacklist(buffer, parent_dirpath, project_dirpath)
 		-- Match project either by Lua pattern or by plain string
 		local is_project_directory_blacklisted = project_dirpath
 			and (
-				(project_dirpath:match(val) == project_dirpath or project_dirname:match(val) == project_dirname)
-				or (project_dirpath:find(val, nil, true) or project_dirname:find(val, nil, true))
+				(project_dirpath:match(val) == project_dirpath or (project_dirname and project_dirname:match(val) == project_dirname))
+				or (project_dirpath:find(val, nil, true) or (project_dirname and project_dirname:find(val, nil, true)))
 			)
 		if is_project_directory_blacklisted then
 			return true
@@ -919,8 +1013,131 @@ function Presence:get_buttons(buffer, parent_dirpath)
 	return nil
 end
 
+-- Check if user is idle and update activity accordingly
+function Presence:check_idle_state()
+	-- Skip if idle detection is disabled
+	if not self.options.enable_idle or self.options.enable_idle == 0 then
+		return
+	end
+	
+	local current_time = os.time()
+	local time_since_activity = current_time - self.last_activity_time
+	
+	if not self.is_idle and time_since_activity >= self.options.idle_timeout then
+		self.log:debug("User is now idle")
+		self.is_idle = true
+		self:set_idle_activity()
+	elseif self.is_idle and time_since_activity >= self.options.idle_timeout then
+		-- Update idle activity to show current idle time
+		self:set_idle_activity()
+	elseif self.is_idle and time_since_activity < self.options.idle_timeout then
+		self.log:debug("User is no longer idle")
+		self.is_idle = false
+		-- Force an activity update
+		self:update()
+	end
+end
+
+-- Set idle activity
+function Presence:set_idle_activity()
+	-- Get the current buffer to create the same config as other handlers
+	local current_buffer = vim.api.nvim_get_current_buf()
+	local buffer_name = vim.api.nvim_buf_get_name(current_buffer)
+	
+	-- Create the same config object as other handlers (already includes idle info)
+	local config = create_config(self, buffer_name)
+	
+	-- First get the original activity status (what the user was doing when they went AFK)
+	local original_status_text, original_details_text, original_large_image, original_large_text, original_small_image, original_small_text = self:get_status_text(config)
+	
+	-- Then get idle-specific customizations if the user has defined idle_text
+	local idle_status_text, idle_details_text, idle_large_image, idle_large_text, idle_small_image, idle_small_text
+	if self.options.idle_text and type(self.options.idle_text) == "function" then
+		local success, result1, result2, result3, result4, result5, result6 = pcall(self.format_status_text, self, "idle", config)
+		if success then
+			idle_status_text, idle_details_text, idle_large_image, idle_large_text, idle_small_image, idle_small_text = result1, result2, result3, result4, result5, result6
+		else
+			self.log:error(string.format("Error in idle_text function: %s", result1))
+		end
+	end
+	
+	-- Use original activity as base, but allow idle function to override specific parts
+	local status_text = idle_status_text or original_status_text or "Idle"
+	local details_text = idle_details_text or original_details_text or "Away from keyboard"
+	local custom_large_image = idle_large_image or original_large_image
+	local custom_large_text = idle_large_text or original_large_text
+	local custom_small_image = idle_small_image or original_small_image
+	local custom_small_text = idle_small_text or original_small_text
+	
+	local idle_asset = self.options.idle_asset
+	
+	-- Check if user has defined a custom idle asset
+	if self.options.file_assets and self.options.file_assets.idle then
+		local idle_asset_config = self.options.file_assets.idle
+		if type(idle_asset_config) == "table" and #idle_asset_config >= 2 then
+			idle_asset = idle_asset_config[2] -- Use the asset key from user config
+		end
+	end
+	
+	local use_file_as_main_image = self.options.main_image == "file"
+	local neovim_image_text = self.options.neovim_image_text
+	
+	-- Default idle asset configuration
+	local default_large_image = use_file_as_main_image and idle_asset or "neovim"
+	local default_large_text = use_file_as_main_image and "Away" or neovim_image_text
+	local default_small_image = use_file_as_main_image and "neovim" or idle_asset
+	local default_small_text = use_file_as_main_image and neovim_image_text or "Away"
+	
+	-- Use custom values if provided, otherwise fall back to defaults
+	local assets = {
+		large_image = custom_large_image or default_large_image,
+		large_text = custom_large_text or default_large_text,
+		small_image = custom_small_image or default_small_image,
+		small_text = custom_small_text or default_small_text,
+	}
+	
+	-- Use session time if enabled, otherwise use activity time
+	local timestamp = self.options.use_session_time and self.started_at or self.last_activity_time
+	
+	local activity = {
+		state = status_text,
+		details = details_text,
+		assets = assets,
+		timestamps = self.options.show_time == 1 and { start = timestamp } or nil,
+	}
+	
+	self.discord:set_activity(activity, function(err)
+		if err then
+			self.log:error(string.format("Failed to set idle activity: %s", err))
+		else
+			self.log:debug("Successfully set idle activity")
+		end
+	end)
+end
+
+-- Start idle timer
+function Presence:start_idle_timer()
+	if self.idle_timer then
+		self.idle_timer:stop()
+		self.idle_timer:close()
+	end
+	
+	local uv = vim.uv or vim.loop
+	self.idle_timer = uv.new_timer()
+	self.idle_timer:start(1000, 1000, vim.schedule_wrap(function()
+		self:check_idle_state()
+	end))
+end
+
 -- Update Rich Presence for the provided vim buffer
 function Presence:update_for_buffer(buffer, should_debounce)
+	-- Update activity time and reset idle state
+	self.last_activity_time = os.time()
+	if self.is_idle then
+		self.is_idle = false
+		self.log:debug("User activity detected, no longer idle")
+	end
+	
 	local config = create_config(self, buffer)
 
 	if config == nil then
@@ -929,13 +1146,12 @@ function Presence:update_for_buffer(buffer, should_debounce)
 	end
 
 	-- Avoid unnecessary updates if the previous activity was for the current buffer
-	-- (allow same-buffer updates when line numbers are enabled)
-	if self.options.enable_line_number == 0 and self.last_activity.file == buffer then
+	if self.last_activity.file == buffer then
 		self.log:debug(string.format("Activity already set for %s, skipping...", config.filename))
 		return
 	end
 
-	local status_text = self:get_status_text(config)
+	local status_text, details_text, custom_large_image, custom_large_text, custom_small_image, custom_small_text = self:get_status_text(config)
 	if not status_text then
 		return self.log:debug("No status text for the given buffer, skipping...")
 	end
@@ -969,7 +1185,10 @@ function Presence:update_for_buffer(buffer, should_debounce)
 	local description = config.filename
 
 	-- 1. Check for user-defined specific assets (highest priority)
-	local user_asset = self.user_file_assets[config.filename] or self.user_file_assets[config.filetype]
+	local user_asset = self.user_file_assets[config.filename]
+		or self.user_file_assets[config.filetype]
+		or self.user_file_assets[config.extension]
+
 	if user_asset then
 		local name, raw_asset_key, asset_description = unpack(user_asset)
 		config.name = name
@@ -991,7 +1210,9 @@ function Presence:update_for_buffer(buffer, should_debounce)
 		)
 	-- 3. Fall back to default file assets (lower priority)
 	else
-		local default_asset = self.options.file_assets[config.filename] or self.options.file_assets[config.filetype]
+		local default_asset = self.options.file_assets[config.filename]
+			or self.options.file_assets[config.filetype]
+			or self.options.file_assets[config.extension]
 		if default_asset then
 			local name, raw_asset_key, asset_description = unpack(default_asset)
 			config.name = name
@@ -1008,17 +1229,26 @@ function Presence:update_for_buffer(buffer, should_debounce)
 	local neovim_image_text = self.options.neovim_image_text
 	local use_file_as_main_image = self.options.main_image == "file"
 	local use_neovim_as_main_image = self.options.main_image == "neovim"
+	
+	-- Default asset configuration
+	local default_large_image = use_file_as_main_image and asset_key
+		or use_neovim_as_main_image and "neovim"
+		or self.options.main_image
+	local default_large_text = use_file_as_main_image and file_text or neovim_image_text
+	local default_small_image = use_file_as_main_image and "neovim" or asset_key
+	local default_small_text = use_file_as_main_image and neovim_image_text or file_text
+	
+	-- Use custom values if provided, otherwise fall back to defaults
 	local assets = {
-		large_image = use_file_as_main_image and asset_key
-			or use_neovim_as_main_image and "neovim"
-			or self.options.main_image,
-		large_text = use_file_as_main_image and file_text or neovim_image_text,
-		small_image = use_file_as_main_image and "neovim" or asset_key,
-		small_text = use_file_as_main_image and neovim_image_text or file_text,
+		large_image = custom_large_image or default_large_image,
+		large_text = custom_large_text or default_large_text,
+		small_image = custom_small_image or default_small_image,
+		small_text = custom_small_text or default_small_text,
 	}
 
 	local activity = {
 		state = status_text,
+		details = details_text,
 		assets = assets,
 		timestamps = self.options.show_time == 1 and { start = relative_activity_set_at } or nil,
 	}
@@ -1032,12 +1262,35 @@ function Presence:update_for_buffer(buffer, should_debounce)
 		end
 	end
 
-	-- Get the current line number and line count if the user has set the enable_line_number option
-	if self.options.enable_line_number == 1 then
-		self.log:debug("Getting line number for current buffer...")
-		local line_number_text = self:format_status_text("line_number", config)
+	-- Include project details if available
+	if config.project_name then
+		self.log:debug(string.format("Detected project: %s", config.project_name))
 
-		activity.details = line_number_text
+		self.workspace = config.project_path
+		self.last_activity = {
+			id = self.id,
+			file = buffer,
+			set_at = activity_set_at,
+			relative_set_at = relative_activity_set_at,
+			workspace = config.project_path,
+		}
+
+		if self.workspaces[config.project_path] then
+			self.workspaces[config.project_path].updated_at = activity_set_at
+			local workspace_start_time = self.options.use_session_time == 1 and self.session_started_at
+				or self.workspaces[config.project_path].started_at
+			activity.timestamps = self.options.show_time == 1 and { start = workspace_start_time } or nil
+		else
+			local workspace_start_time = self.options.use_session_time == 1 and self.session_started_at
+				or activity_set_at
+			self.workspaces[config.project_path] = {
+				started_at = workspace_start_time,
+				updated_at = activity_set_at,
+			}
+		end
+	else
+		self.log:debug("No project detected")
+
 		self.workspace = nil
 		self.last_activity = {
 			id = self.id,
@@ -1046,61 +1299,6 @@ function Presence:update_for_buffer(buffer, should_debounce)
 			relative_set_at = relative_activity_set_at,
 			workspace = nil,
 		}
-	else
-		-- Include project details if available and if the user hasn't set the enable_line_number option
-		if config.project_name then
-			self.log:debug(string.format("Detected project: %s", config.project_name))
-
-			activity.details = self:format_status_text("workspace", config)
-
-			self.workspace = config.project_path
-			self.last_activity = {
-				id = self.id,
-				file = buffer,
-				set_at = activity_set_at,
-				relative_set_at = relative_activity_set_at,
-				workspace = config.project_path,
-			}
-
-			if self.workspaces[config.project_path] then
-				self.workspaces[config.project_path].updated_at = activity_set_at
-				local workspace_start_time = self.options.use_session_time == 1 and self.session_started_at
-					or self.workspaces[config.project_path].started_at
-				activity.timestamps = self.options.show_time == 1 and { start = workspace_start_time } or nil
-			else
-				local workspace_start_time = self.options.use_session_time == 1 and self.session_started_at
-					or activity_set_at
-				self.workspaces[config.project_path] = {
-					started_at = workspace_start_time,
-					updated_at = activity_set_at,
-				}
-			end
-		else
-			self.log:debug("No project detected")
-
-			self.workspace = nil
-			self.last_activity = {
-				id = self.id,
-				file = buffer,
-				set_at = activity_set_at,
-				relative_set_at = relative_activity_set_at,
-				workspace = nil,
-			}
-
-			-- When no project is detected, set custom workspace text if:
-			-- * The custom function returns custom workspace text
-			-- * The configured workspace text does not contain a directive
-			-- (can't use the `format_status_text` method here)
-			local workspace_text = self.options.workspace_text
-			if type(workspace_text) == "function" then
-				local custom_workspace_text = workspace_text(config)
-				if custom_workspace_text then
-					activity.details = custom_workspace_text
-				end
-			elseif not workspace_text:find("%s") then
-				activity.details = workspace_text
-			end
-		end
 	end
 
 	-- Sync activity to all peers
