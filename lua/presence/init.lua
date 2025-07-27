@@ -77,6 +77,7 @@ local function create_config(self, buffer)
 
 	local filename = self.get_filename(buffer, self.os.path_separator)
 	local parent_dirpath = self.get_dir_path(buffer, self.os.path_separator)
+	local extension = filename and self.get_file_extension(filename) or nil
 
 	self.log:debug(string.format("Filename: %s, Parent Directory Path: %s", filename, parent_dirpath))
 
@@ -93,6 +94,7 @@ local function create_config(self, buffer)
 
 	return {
 		filename = filename,
+		extension = extension,
 		line_number = line_number[1],
 		line_col = line_number[2],
 		line_count = line_count,
@@ -176,6 +178,15 @@ function Presence:setup(...)
 	self:set_option("use_session_time", false)
 	-- File assets options
 	self:set_option("file_assets", {})
+	self:set_option("file_asset_url_template", nil)
+
+	-- Store user-defined file assets separately from defaults
+	self.user_file_assets = {}
+	for name, asset in pairs(self.options.file_assets) do
+		self.user_file_assets[name] = asset
+	end
+
+	-- Merge defaults into the main file_assets table
 	for name, asset in pairs(default_file_assets) do
 		if not self.options.file_assets[name] then
 			self.options.file_assets[name] = asset
@@ -480,61 +491,61 @@ end
 
 -- Gets the current project name
 function Presence:get_project_name(file_path)
-    if not file_path then
-        return nil, nil, nil
-    end
+	if not file_path then
+		return nil, nil, nil
+	end
 
-    -- Escape quotes in the file path
-    file_path = file_path:gsub([["]], [[\"]])
+	-- Escape quotes in the file path
+	file_path = file_path:gsub([["]], [[\"]])
 
-    -- TODO: Only checks for a git repository, could add more checks here
-    -- Might want to run this in a background process depending on performance
-    local project_path_cmd = "git rev-parse --show-toplevel"
-    project_path_cmd = file_path and string.format([[cd "%s" && %s]], file_path, project_path_cmd) or project_path_cmd
+	-- TODO: Only checks for a git repository, could add more checks here
+	-- Might want to run this in a background process depending on performance
+	local project_path_cmd = "git rev-parse --show-toplevel"
+	project_path_cmd = file_path and string.format([[cd "%s" && %s]], file_path, project_path_cmd) or project_path_cmd
 
-    local project_path = vim.fn.system(project_path_cmd)
-    project_path = vim.trim(project_path)
+	local project_path = vim.fn.system(project_path_cmd)
+	project_path = vim.trim(project_path)
 
-    if project_path:find("fatal.*") then
-        self.log:info("Not a git repository, skipping...")
-        return nil, nil, nil
-    end
-    if vim.v.shell_error ~= 0 or #project_path == 0 then
-        local message_fmt = "Failed to get project name (error code %d): %s"
-        self.log:error(string.format(message_fmt, vim.v.shell_error, project_path))
-        return nil, nil, nil
-    end
+	if project_path:find("fatal.*") then
+		self.log:info("Not a git repository, skipping...")
+		return nil, nil, nil
+	end
+	if vim.v.shell_error ~= 0 or #project_path == 0 then
+		local message_fmt = "Failed to get project name (error code %d): %s"
+		self.log:error(string.format(message_fmt, vim.v.shell_error, project_path))
+		return nil, nil, nil
+	end
 
-    if self.os.name == "windows" then
-        project_path = project_path:gsub("/", [[\]])
-    end
+	if self.os.name == "windows" then
+		project_path = project_path:gsub("/", [[\]])
+	end
 
-    local repo_name_cmd = [[basename -s .git "$(git config --get remote.origin.url)"]]
-    repo_name_cmd = file_path and string.format([[cd "%s" && %s]], file_path, repo_name_cmd) or repo_name_cmd
+	local repo_name_cmd = [[basename -s .git "$(git config --get remote.origin.url)"]]
+	repo_name_cmd = file_path and string.format([[cd "%s" && %s]], file_path, repo_name_cmd) or repo_name_cmd
 
-    local repo_name = vim.fn.system(repo_name_cmd)
-    repo_name = vim.trim(repo_name)
+	local repo_name = vim.fn.system(repo_name_cmd)
+	repo_name = vim.trim(repo_name)
 
-    if vim.v.shell_error ~= 0 or #repo_name == 0 then
-        local message_fmt = "Failed to get repository name (error code %d): %s"
-        self.log:error(string.format(message_fmt, vim.v.shell_error, repo_name))
-        return nil, project_path, nil
-    end
+	if vim.v.shell_error ~= 0 or #repo_name == 0 then
+		local message_fmt = "Failed to get repository name (error code %d): %s"
+		self.log:error(string.format(message_fmt, vim.v.shell_error, repo_name))
+		return nil, project_path, nil
+	end
 
-    -- Fetch the branch name
-    local branch_name_cmd = "git rev-parse --abbrev-ref HEAD"
-    branch_name_cmd = file_path and string.format([[cd "%s" && %s]], file_path, branch_name_cmd) or branch_name_cmd
+	-- Fetch the branch name
+	local branch_name_cmd = "git rev-parse --abbrev-ref HEAD"
+	branch_name_cmd = file_path and string.format([[cd "%s" && %s]], file_path, branch_name_cmd) or branch_name_cmd
 
-    local branch_name = vim.fn.system(branch_name_cmd)
-    branch_name = vim.trim(branch_name)
+	local branch_name = vim.fn.system(branch_name_cmd)
+	branch_name = vim.trim(branch_name)
 
-    if vim.v.shell_error ~= 0 or #branch_name == 0 then
-        local message_fmt = "Failed to get branch name (error code %d): %s"
-        self.log:error(string.format(message_fmt, vim.v.shell_error, branch_name))
-        return repo_name, project_path, nil
-    end
+	if vim.v.shell_error ~= 0 or #branch_name == 0 then
+		local message_fmt = "Failed to get branch name (error code %d): %s"
+		self.log:error(string.format(message_fmt, vim.v.shell_error, branch_name))
+		return repo_name, project_path, nil
+	end
 
-    return repo_name, project_path, branch_name
+	return repo_name, project_path, branch_name
 end
 
 -- Get the name of the parent directory for the given path
@@ -561,6 +572,18 @@ function Presence:format_status_text(status_type, config)
 	else
 		return string.format(text_option, config.filename)
 	end
+end
+
+-- Process URL templates by replacing placeholders with actual values
+function Presence:process_asset_url_template(url_template, config)
+	if type(url_template) ~= "string" then
+		return url_template
+	end
+
+	local processed_url = url_template:gsub("{lang}", config.extension or "")
+	P(processed_url)
+
+	return processed_url
 end
 
 -- Get the status text for the current buffer
@@ -941,13 +964,43 @@ function Presence:update_for_buffer(buffer, should_debounce)
 
 	self.log:debug(string.format("Setting activity for %s...", buffer and #buffer > 0 and buffer or "unnamed buffer"))
 
-	-- Determine image text and asset key
+	-- Determine image text and asset key with proper precedence
 	local asset_key = "code"
 	local description = config.filename
-	local file_asset = self.options.file_assets[config.filename] or self.options.file_assets[config.filetype]
-	if file_asset then
-		config.name, asset_key, description = unpack(file_asset)
-		self.log:debug(string.format("Using file asset: %s", vim.inspect(file_asset)))
+
+	-- 1. Check for user-defined specific assets (highest priority)
+	local user_asset = self.user_file_assets[config.filename] or self.user_file_assets[config.filetype]
+	if user_asset then
+		local name, raw_asset_key, asset_description = unpack(user_asset)
+		config.name = name
+		asset_key = self:process_asset_url_template(raw_asset_key, config)
+		description = asset_description
+		self.log:debug(
+			string.format("Using user-defined file asset: %s (processed: %s)", vim.inspect(user_asset), asset_key)
+		)
+	-- 2. Check for global URL template (medium priority)
+	elseif self.options.file_asset_url_template then
+		asset_key = self:process_asset_url_template(self.options.file_asset_url_template, config)
+		description = config.filename
+		self.log:debug(
+			string.format(
+				"Using global file asset template: %s (processed: %s)",
+				self.options.file_asset_url_template,
+				asset_key
+			)
+		)
+	-- 3. Fall back to default file assets (lower priority)
+	else
+		local default_asset = self.options.file_assets[config.filename] or self.options.file_assets[config.filetype]
+		if default_asset then
+			local name, raw_asset_key, asset_description = unpack(default_asset)
+			config.name = name
+			asset_key = self:process_asset_url_template(raw_asset_key, config)
+			description = asset_description
+			self.log:debug(
+				string.format("Using default file asset: %s (processed: %s)", vim.inspect(default_asset), asset_key)
+			)
+		end
 	end
 
 	-- Construct activity asset information
@@ -1011,15 +1064,11 @@ function Presence:update_for_buffer(buffer, should_debounce)
 
 			if self.workspaces[config.project_path] then
 				self.workspaces[config.project_path].updated_at = activity_set_at
-				local workspace_start_time = self.options.use_session_time == 1 
-					and self.session_started_at 
+				local workspace_start_time = self.options.use_session_time == 1 and self.session_started_at
 					or self.workspaces[config.project_path].started_at
-				activity.timestamps = self.options.show_time == 1
-						and { start = workspace_start_time }
-					or nil
+				activity.timestamps = self.options.show_time == 1 and { start = workspace_start_time } or nil
 			else
-				local workspace_start_time = self.options.use_session_time == 1 
-					and self.session_started_at 
+				local workspace_start_time = self.options.use_session_time == 1 and self.session_started_at
 					or activity_set_at
 				self.workspaces[config.project_path] = {
 					started_at = workspace_start_time,
