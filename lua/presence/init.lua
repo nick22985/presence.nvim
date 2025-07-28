@@ -62,6 +62,7 @@ Presence.workspaces = {}
 Presence.is_idle = false
 Presence.last_activity_time = os.time()
 Presence.idle_timer = nil
+Presence.last_active_peer = nil
 
 local log = require("lib.log")
 local msgpack = require("deps.msgpack")
@@ -146,7 +147,7 @@ local function create_config(self, buffer)
 		end
 	end
 
-	local problems_total = problems.error + problems.warn + problems.info + problems.hint
+	local problems_total = problems.error + problems.warn
 
 	-- Add idle state information
 	local current_time = os.time()
@@ -293,13 +294,19 @@ function Presence:setup(...)
 
 	-- Initialize session start time for use_session_time option
 	self.session_started_at = os.time()
-	
+
 	-- Initialize idle tracking
 	self.last_activity_time = os.time()
 	self.is_idle = false
-	
+	-- Set this instance as the initial last active peer
+	self.last_active_peer = self.id
+
 	-- Start idle timer if enabled and idle_timeout is set
-	if (self.options.enable_idle == 1 or self.options.enable_idle == true) and self.options.idle_timeout and self.options.idle_timeout > 0 then
+	if
+		(self.options.enable_idle == 1 or self.options.enable_idle == true)
+		and self.options.idle_timeout
+		and self.options.idle_timeout > 0
+	then
 		self:start_idle_timer()
 		self.log:debug(string.format("Started idle timer with timeout: %d seconds", self.options.idle_timeout))
 	end
@@ -654,7 +661,12 @@ function Presence:format_status_text(status_type, config)
 		local result = text_option(config)
 		-- If function returns a table, extract all possible fields
 		if type(result) == "table" then
-			return result.state, result.details, result.large_image, result.large_text, result.small_image, result.small_text
+			return result.state,
+				result.details,
+				result.large_image,
+				result.large_text,
+				result.small_image,
+				result.small_text
 		else
 			-- Otherwise use the result as state and no details
 			return result, nil, nil, nil, nil, nil
@@ -887,7 +899,10 @@ function Presence:check_blacklist(buffer, parent_dirpath, project_dirpath)
 		-- Match parent either by Lua pattern or by plain string
 		local is_parent_directory_blacklisted = parent_dirpath
 			and (
-				(parent_dirpath:match(val) == parent_dirpath or (parent_dirname and parent_dirname:match(val) == parent_dirname))
+				(
+					parent_dirpath:match(val) == parent_dirpath
+					or (parent_dirname and parent_dirname:match(val) == parent_dirname)
+				)
 				or (parent_dirpath:find(val, nil, true) or (parent_dirname and parent_dirname:find(val, nil, true)))
 			)
 		if is_parent_directory_blacklisted then
@@ -897,7 +912,10 @@ function Presence:check_blacklist(buffer, parent_dirpath, project_dirpath)
 		-- Match project either by Lua pattern or by plain string
 		local is_project_directory_blacklisted = project_dirpath
 			and (
-				(project_dirpath:match(val) == project_dirpath or (project_dirname and project_dirname:match(val) == project_dirname))
+				(
+					project_dirpath:match(val) == project_dirpath
+					or (project_dirname and project_dirname:match(val) == project_dirname)
+				)
 				or (project_dirpath:find(val, nil, true) or (project_dirname and project_dirname:find(val, nil, true)))
 			)
 		if is_project_directory_blacklisted then
@@ -1019,12 +1037,25 @@ function Presence:check_idle_state()
 	if not self.options.enable_idle or self.options.enable_idle == 0 then
 		return
 	end
-	
+
+	-- Check if the last active peer is still reachable (if it's not self)
+	if self.last_active_peer ~= self.id then
+		if self:is_last_active_peer_reachable() then
+			self.log:debug(string.format("Skipping idle check - not the last active peer (last active: %s, current: %s)", self.last_active_peer, self.id))
+			return
+		else
+			-- Last active peer is unreachable, take over as last active peer
+			self.log:debug(string.format("Last active peer %s is unreachable, taking over as last active peer", self.last_active_peer))
+			self.last_active_peer = self.id
+			self:sync_last_active_peer()
+		end
+	end
+
 	local current_time = os.time()
 	local time_since_activity = current_time - self.last_activity_time
-	
+
 	if not self.is_idle and time_since_activity >= self.options.idle_timeout then
-		self.log:debug("User is now idle")
+		self.log:debug("User is now idle (last active peer)")
 		self.is_idle = true
 		self:set_idle_activity()
 	elseif self.is_idle and time_since_activity >= self.options.idle_timeout then
@@ -1043,24 +1074,27 @@ function Presence:set_idle_activity()
 	-- Get the current buffer to create the same config as other handlers
 	local current_buffer = vim.api.nvim_get_current_buf()
 	local buffer_name = vim.api.nvim_buf_get_name(current_buffer)
-	
+
 	-- Create the same config object as other handlers (already includes idle info)
 	local config = create_config(self, buffer_name)
-	
+
 	-- First get the original activity status (what the user was doing when they went AFK)
-	local original_status_text, original_details_text, original_large_image, original_large_text, original_small_image, original_small_text = self:get_status_text(config)
-	
+	local original_status_text, original_details_text, original_large_image, original_large_text, original_small_image, original_small_text =
+		self:get_status_text(config)
+
 	-- Then get idle-specific customizations if the user has defined idle_text
 	local idle_status_text, idle_details_text, idle_large_image, idle_large_text, idle_small_image, idle_small_text
 	if self.options.idle_text and type(self.options.idle_text) == "function" then
-		local success, result1, result2, result3, result4, result5, result6 = pcall(self.format_status_text, self, "idle", config)
+		local success, result1, result2, result3, result4, result5, result6 =
+			pcall(self.format_status_text, self, "idle", config)
 		if success then
-			idle_status_text, idle_details_text, idle_large_image, idle_large_text, idle_small_image, idle_small_text = result1, result2, result3, result4, result5, result6
+			idle_status_text, idle_details_text, idle_large_image, idle_large_text, idle_small_image, idle_small_text =
+				result1, result2, result3, result4, result5, result6
 		else
 			self.log:error(string.format("Error in idle_text function: %s", result1))
 		end
 	end
-	
+
 	-- Use original activity as base, but allow idle function to override specific parts
 	local status_text = idle_status_text or original_status_text or "Idle"
 	local details_text = idle_details_text or original_details_text or "Away from keyboard"
@@ -1068,9 +1102,9 @@ function Presence:set_idle_activity()
 	local custom_large_text = idle_large_text or original_large_text
 	local custom_small_image = idle_small_image or original_small_image
 	local custom_small_text = idle_small_text or original_small_text
-	
+
 	local idle_asset = self.options.idle_asset
-	
+
 	-- Check if user has defined a custom idle asset
 	if self.options.file_assets and self.options.file_assets.idle then
 		local idle_asset_config = self.options.file_assets.idle
@@ -1078,16 +1112,16 @@ function Presence:set_idle_activity()
 			idle_asset = idle_asset_config[2] -- Use the asset key from user config
 		end
 	end
-	
+
 	local use_file_as_main_image = self.options.main_image == "file"
 	local neovim_image_text = self.options.neovim_image_text
-	
+
 	-- Default idle asset configuration
 	local default_large_image = use_file_as_main_image and idle_asset or "neovim"
 	local default_large_text = use_file_as_main_image and "Away" or neovim_image_text
 	local default_small_image = use_file_as_main_image and "neovim" or idle_asset
 	local default_small_text = use_file_as_main_image and neovim_image_text or "Away"
-	
+
 	-- Use custom values if provided, otherwise fall back to defaults
 	local assets = {
 		large_image = custom_large_image or default_large_image,
@@ -1095,17 +1129,17 @@ function Presence:set_idle_activity()
 		small_image = custom_small_image or default_small_image,
 		small_text = custom_small_text or default_small_text,
 	}
-	
+
 	-- Use session time if enabled, otherwise use activity time
 	local timestamp = self.options.use_session_time and self.started_at or self.last_activity_time
-	
+
 	local activity = {
 		state = status_text,
 		details = details_text,
 		assets = assets,
 		timestamps = self.options.show_time == 1 and { start = timestamp } or nil,
 	}
-	
+
 	self.discord:set_activity(activity, function(err)
 		if err then
 			self.log:error(string.format("Failed to set idle activity: %s", err))
@@ -1121,12 +1155,16 @@ function Presence:start_idle_timer()
 		self.idle_timer:stop()
 		self.idle_timer:close()
 	end
-	
+
 	local uv = vim.uv or vim.loop
 	self.idle_timer = uv.new_timer()
-	self.idle_timer:start(1000, 1000, vim.schedule_wrap(function()
-		self:check_idle_state()
-	end))
+	self.idle_timer:start(
+		1000,
+		1000,
+		vim.schedule_wrap(function()
+			self:check_idle_state()
+		end)
+	)
 end
 
 -- Update Rich Presence for the provided vim buffer
@@ -1137,7 +1175,14 @@ function Presence:update_for_buffer(buffer, should_debounce)
 		self.is_idle = false
 		self.log:debug("User activity detected, no longer idle")
 	end
-	
+
+	-- Set this peer as the last active peer and sync to all peers
+	if self.last_active_peer ~= self.id then
+		self.log:debug(string.format("Setting this peer as last active (was: %s, now: %s)", self.last_active_peer, self.id))
+		self.last_active_peer = self.id
+		self:sync_last_active_peer()
+	end
+
 	local config = create_config(self, buffer)
 
 	if config == nil then
@@ -1151,7 +1196,8 @@ function Presence:update_for_buffer(buffer, should_debounce)
 		return
 	end
 
-	local status_text, details_text, custom_large_image, custom_large_text, custom_small_image, custom_small_text = self:get_status_text(config)
+	local status_text, details_text, custom_large_image, custom_large_text, custom_small_image, custom_small_text =
+		self:get_status_text(config)
 	if not status_text then
 		return self.log:debug("No status text for the given buffer, skipping...")
 	end
@@ -1229,7 +1275,7 @@ function Presence:update_for_buffer(buffer, should_debounce)
 	local neovim_image_text = self.options.neovim_image_text
 	local use_file_as_main_image = self.options.main_image == "file"
 	local use_neovim_as_main_image = self.options.main_image == "neovim"
-	
+
 	-- Default asset configuration
 	local default_large_image = use_file_as_main_image and asset_key
 		or use_neovim_as_main_image and "neovim"
@@ -1237,7 +1283,7 @@ function Presence:update_for_buffer(buffer, should_debounce)
 	local default_large_text = use_file_as_main_image and file_text or neovim_image_text
 	local default_small_image = use_file_as_main_image and "neovim" or asset_key
 	local default_small_text = use_file_as_main_image and neovim_image_text or file_text
-	
+
 	-- Use custom values if provided, otherwise fall back to defaults
 	local assets = {
 		large_image = custom_large_image or default_large_image,
@@ -1358,6 +1404,7 @@ function Presence:register_peer(id, socket)
 	self.peers[id] = {
 		socket = socket,
 		workspace = nil,
+		last_activity_time = 0, -- New peers haven't been active yet
 	}
 
 	self.log:info(string.format("Registered peer %s", id))
@@ -1385,6 +1432,15 @@ function Presence:unregister_peer(id, peer)
 	end
 
 	self.peers = peers
+
+	-- Handle last_active_peer transfer if the removed peer was the last active one
+	if self.last_active_peer == id then
+		local next_active_peer = self:select_next_active_peer()
+		self.log:debug(string.format("Transferring last_active_peer from %s to %s", id, next_active_peer))
+		self.last_active_peer = next_active_peer
+		-- Sync the change to all remaining peers
+		self:sync_last_active_peer()
+	end
 
 	-- Update workspaces if necessary
 	local workspaces = {}
@@ -1419,6 +1475,7 @@ function Presence:register_and_sync_peer(id, socket)
 		[self.id] = {
 			socket = self.socket,
 			workspace = self.workspace,
+			last_activity_time = self.last_activity_time,
 		},
 	}
 	for peer_id, peer in pairs(self.peers) do
@@ -1432,6 +1489,7 @@ function Presence:register_and_sync_peer(id, socket)
 			last_activity = self.last_activity,
 			peers = peers,
 			workspaces = self.workspaces,
+			last_active_peer = self.last_active_peer,
 		},
 	})
 end
@@ -1496,17 +1554,25 @@ function Presence:sync_self_activity()
 	local self_as_peer = {
 		socket = self.socket,
 		workspace = self.workspace,
+		last_activity_time = self.last_activity_time,
 	}
 
 	for id, peer in pairs(self.peers) do
 		self.log:debug(string.format("Syncing activity to peer %s...", id))
 
-		local peers = { [self.id] = self_as_peer }
+		local peers = { 
+			[self.id] = {
+				socket = self.socket,
+				workspace = self.workspace,
+				last_activity_time = self.last_activity_time,
+			}
+		}
 		for peer_id, peer_data in pairs(self.peers) do
 			if peer_id ~= id then
 				peers[peer_id] = {
 					socket = peer_data.socket,
 					workspace = peer_data.workspace,
+					last_activity_time = peer_data.last_activity_time,
 				}
 			end
 		end
@@ -1516,9 +1582,90 @@ function Presence:sync_self_activity()
 				last_activity = self.last_activity,
 				peers = peers,
 				workspaces = self.workspaces,
+				last_active_peer = self.last_active_peer,
 			},
 		})
 	end
+end
+
+-- Sync last active peer to all peers
+function Presence:sync_last_active_peer()
+	local current_time = os.time()
+	for id, peer in pairs(self.peers) do
+		self.log:debug(string.format("Syncing last active peer to peer %s...", id))
+		self:call_remote_method(peer.socket, "update_last_active_peer", { 
+			self.last_active_peer,
+			current_time  -- Send the time when this peer became active
+		})
+	end
+end
+
+-- Update last active peer from remote peer
+function Presence:update_last_active_peer(peer_id, activity_time)
+	self.log:debug(string.format("Updating last active peer to: %s", peer_id))
+	self.last_active_peer = peer_id
+	
+	-- Update the activity time for the peer that became active
+	if self.peers[peer_id] then
+		self.peers[peer_id].last_activity_time = activity_time or os.time()
+	end
+end
+
+-- Select the next most recently active peer from available peers
+function Presence:select_next_active_peer()
+	local most_recent_peer = self.id  -- Default to self
+	local most_recent_time = self.last_activity_time or 0
+	
+	-- Check all peers
+	for peer_id, peer_data in pairs(self.peers) do
+		local peer_time = peer_data.last_activity_time or 0
+		if peer_time > most_recent_time then
+			most_recent_peer = peer_id
+			most_recent_time = peer_time
+		end
+	end
+	
+	return most_recent_peer
+end
+
+-- Check if the last active peer is still reachable
+function Presence:is_last_active_peer_reachable()
+	-- If last active peer is self, it's always reachable
+	if self.last_active_peer == self.id then
+		return true
+	end
+	
+	-- Check if the peer still exists in our peers list
+	local peer = self.peers[self.last_active_peer]
+	if not peer then
+		self.log:debug(string.format("Last active peer %s not found in peers list", self.last_active_peer))
+		return false
+	end
+	
+	-- Check if we haven't heard from the last active peer in a reasonable time
+	-- If the last active peer hasn't been active for longer than 2x the idle timeout,
+	-- and we have more recent activity, assume it's gone
+	local current_time = os.time()
+	local peer_last_activity = peer.last_activity_time or 0
+	local self_last_activity = self.last_activity_time or 0
+	local timeout_threshold = (self.options.idle_timeout or 300) * 2
+	
+	-- If the peer's last activity is very old compared to ours, it might be gone
+	if (current_time - peer_last_activity) > timeout_threshold and 
+	   self_last_activity > peer_last_activity then
+		self.log:debug(string.format("Last active peer %s seems stale (last activity: %d, threshold: %d)", 
+			self.last_active_peer, peer_last_activity, timeout_threshold))
+		return false
+	end
+	
+	return true
+end
+
+-- Handle health check ping from other peers
+function Presence:ping_health_check(sender_id)
+	self.log:debug(string.format("Received health check ping from %s", sender_id))
+	-- Simply existing and being able to receive this call means we're healthy
+	return true
 end
 
 -- Sync activity set by peer
